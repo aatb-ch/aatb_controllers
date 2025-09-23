@@ -1,0 +1,11 @@
+<library path="aatb_controllers">
+  <class name="aatb_controllers/ConstrainedPositionController"
+         type="aatb_controllers::ConstrainedPositionController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Position controller that uses Ruckig motion generator to apply velocity, acceleration,
+      and jerk constraints to commanded positions before forwarding them to hardware.
+      Accepts std_msgs/Float64MultiArray commands and generates smooth, constrained trajectories.
+    </description>
+  </class>
+</library>
