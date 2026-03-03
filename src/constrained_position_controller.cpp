@@ -2,7 +2,6 @@
 #include "aatb_controllers/constrained_position_controller.hpp"
 
 #include <algorithm>
-#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -206,15 +205,9 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_activate(
     joint_position_state_interfaces_.emplace_back(std::ref(*it));
   }
 
-  // Set command interfaces to NaN so hardware write() is a no-op
-  // until the first update() cycle writes real values from Ruckig
-  for (size_t i = 0; i < joint_names_.size(); ++i)
-  {
-    joint_position_command_interfaces_[i].get().set_value(
-      std::numeric_limits<double>::quiet_NaN());
-  }
-
-  // Initialize Ruckig with current joint positions
+  // Initialize Ruckig with current joint positions and pre-seed command
+  // interfaces so write() sends the current position even before the first
+  // update() cycle (ur_robot_driver does not guard against NaN in write())
   if (!reset_trajectory_state())
   {
     return controller_interface::CallbackReturn::ERROR;
@@ -354,6 +347,13 @@ bool ConstrainedPositionController::reset_trajectory_state()
     ruckig_input_->target_position = current_positions;
     ruckig_input_->target_velocity = std::vector<double>(joint_names_.size(), 0.0);
     ruckig_input_->target_acceleration = std::vector<double>(joint_names_.size(), 0.0);
+
+    // Pre-seed command interfaces with current positions so write() sends
+    // a safe value even before the first update() cycle
+    for (size_t i = 0; i < joint_names_.size(); ++i)
+    {
+      joint_position_command_interfaces_[i].get().set_value(current_positions[i]);
+    }
 
     trajectory_initialized_ = true;
 
