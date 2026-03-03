@@ -2,6 +2,7 @@
 #include "aatb_controllers/constrained_position_controller.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -166,16 +167,51 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_activate(
   joint_position_command_interfaces_.clear();
   joint_position_state_interfaces_.clear();
 
-  // Assign command interfaces
-  for (auto & interface : command_interfaces_)
+  // Assign command interfaces in joint_names_ order
+  for (const auto & joint_name : joint_names_)
   {
-    joint_position_command_interfaces_.emplace_back(std::ref(interface));
+    auto it = std::find_if(
+      command_interfaces_.begin(), command_interfaces_.end(),
+      [&](const hardware_interface::LoanedCommandInterface & interface) {
+        return interface.get_prefix_name() == joint_name &&
+               interface.get_interface_name() == command_interface_name_;
+      });
+    if (it == command_interfaces_.end())
+    {
+      RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "Command interface '%s/%s' not found", joint_name.c_str(), command_interface_name_.c_str());
+      return controller_interface::CallbackReturn::ERROR;
+    }
+    joint_position_command_interfaces_.emplace_back(std::ref(*it));
   }
 
-  // Assign state interfaces
-  for (auto & interface : state_interfaces_)
+  // Assign state interfaces in joint_names_ order
+  for (const auto & joint_name : joint_names_)
   {
-    joint_position_state_interfaces_.emplace_back(std::ref(interface));
+    auto it = std::find_if(
+      state_interfaces_.begin(), state_interfaces_.end(),
+      [&](const hardware_interface::LoanedStateInterface & interface) {
+        return interface.get_prefix_name() == joint_name &&
+               interface.get_interface_name() == hardware_interface::HW_IF_POSITION;
+      });
+    if (it == state_interfaces_.end())
+    {
+      RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "State interface '%s/%s' not found", joint_name.c_str(),
+        hardware_interface::HW_IF_POSITION);
+      return controller_interface::CallbackReturn::ERROR;
+    }
+    joint_position_state_interfaces_.emplace_back(std::ref(*it));
+  }
+
+  // Set command interfaces to NaN so hardware write() is a no-op
+  // until the first update() cycle writes real values from Ruckig
+  for (size_t i = 0; i < joint_names_.size(); ++i)
+  {
+    joint_position_command_interfaces_[i].get().set_value(
+      std::numeric_limits<double>::quiet_NaN());
   }
 
   // Initialize Ruckig with current joint positions
@@ -197,6 +233,7 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_deactivat
 
   trajectory_initialized_ = false;
   new_command_available_ = false;
+  rt_command_ptr_.writeFromNonRT(nullptr);
 
   RCLCPP_INFO(get_node()->get_logger(), "Controller deactivated");
   return controller_interface::CallbackReturn::SUCCESS;
