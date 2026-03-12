@@ -46,7 +46,6 @@ ConstrainedPositionController::state_interface_configuration() const
   for (const auto & joint : joint_names_)
   {
     config.names.push_back(joint + "/" + hardware_interface::HW_IF_POSITION);
-    config.names.push_back(joint + "/" + hardware_interface::HW_IF_VELOCITY);
   }
 
   return config;
@@ -206,26 +205,6 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_activate(
     joint_position_state_interfaces_.emplace_back(std::ref(*it));
   }
 
-  // Assign velocity state interfaces in joint_names_ order
-  for (const auto & joint_name : joint_names_)
-  {
-    auto it = std::find_if(
-      state_interfaces_.begin(), state_interfaces_.end(),
-      [&](const hardware_interface::LoanedStateInterface & interface) {
-        return interface.get_prefix_name() == joint_name &&
-               interface.get_interface_name() == hardware_interface::HW_IF_VELOCITY;
-      });
-    if (it == state_interfaces_.end())
-    {
-      RCLCPP_ERROR(
-        get_node()->get_logger(),
-        "State interface '%s/%s' not found", joint_name.c_str(),
-        hardware_interface::HW_IF_VELOCITY);
-      return controller_interface::CallbackReturn::ERROR;
-    }
-    joint_velocity_state_interfaces_.emplace_back(std::ref(*it));
-  }
-
   // Initialize Ruckig with current joint positions and pre-seed command
   // interfaces so write() sends the current position even before the first
   // update() cycle (ur_robot_driver does not guard against NaN in write())
@@ -244,7 +223,6 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_deactivat
   // Release interfaces
   joint_position_command_interfaces_.clear();
   joint_position_state_interfaces_.clear();
-  joint_velocity_state_interfaces_.clear();
 
   trajectory_initialized_ = false;
   new_command_available_ = false;
@@ -289,14 +267,8 @@ controller_interface::return_type ConstrainedPositionController::update(
       joint_position_command_interfaces_[i].get().set_value(ruckig_output_->new_position[i]);
     }
 
-    // Close the loop: feed actual state back to Ruckig so the controller
-    // recovers gracefully from safeguard stops or any position divergence
-    for (size_t i = 0; i < joint_names_.size(); ++i)
-    {
-      ruckig_input_->current_position[i] = joint_position_state_interfaces_[i].get().get_value();
-      ruckig_input_->current_velocity[i] = joint_velocity_state_interfaces_[i].get().get_value();
-      ruckig_input_->current_acceleration[i] = 0.0;
-    }
+    // Prepare for next cycle
+    ruckig_output_->pass_to_input(*ruckig_input_);
 
     if (result == ruckig::Result::Finished)
     {
