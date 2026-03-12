@@ -29,3 +29,4 @@ constrained_position_controller:
 
     state_interfaces:
       - position
+      - velocity
