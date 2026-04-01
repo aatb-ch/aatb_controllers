@@ -13,6 +13,7 @@
 #include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 #include "realtime_tools/realtime_buffer.hpp"
+#include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "ruckig/ruckig.hpp"
 
@@ -75,6 +76,13 @@ protected:
   realtime_tools::RealtimeBuffer<std::shared_ptr<std_msgs::msg::Float64MultiArray>> rt_command_ptr_;
   std::shared_ptr<std_msgs::msg::Float64MultiArray> last_command_msg_;
 
+  // Speed scaling (optional — hardware state interface or topic)
+  std::string speed_scaling_state_interface_name_;
+  std::vector<std::reference_wrapper<hardware_interface::LoanedStateInterface>>
+    speed_scaling_state_interface_;
+  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr speed_scaling_subscriber_;
+  realtime_tools::RealtimeBuffer<double> rt_speed_scaling_;
+
   // State tracking
   bool new_command_available_;
   bool trajectory_initialized_;
@@ -87,7 +95,7 @@ protected:
 
 private:
   void command_callback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
-  bool reset_trajectory_state();
+  bool reset_trajectory_state(bool preserve_target = false);
 };
 
 }  // namespace aatb_controllers

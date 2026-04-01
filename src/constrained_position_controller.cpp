@@ -48,6 +48,11 @@ ConstrainedPositionController::state_interface_configuration() const
     config.names.push_back(joint + "/" + hardware_interface::HW_IF_POSITION);
   }
 
+  if (!speed_scaling_state_interface_name_.empty())
+  {
+    config.names.push_back(speed_scaling_state_interface_name_);
+  }
+
   return config;
 }
 
@@ -61,6 +66,7 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_init()
     auto_declare<std::vector<double>>("jerk_limits", std::vector<double>());
     auto_declare<double>("control_cycle_time", 0.001);
     auto_declare<std::string>("interface_name", command_interface_name_);
+    auto_declare<std::string>("speed_scaling.state_interface", "");
   }
   catch (const std::exception & e)
   {
@@ -91,6 +97,11 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_configure
 
   // Read interface name parameter
   command_interface_name_ = get_node()->get_parameter("interface_name").as_string();
+
+  // Speed scaling
+  speed_scaling_state_interface_name_ =
+    get_node()->get_parameter("speed_scaling.state_interface").as_string();
+  rt_speed_scaling_.writeFromNonRT(1.0);
 
   // Validate constraint dimensions
   if (velocity_limits_.size() != num_joints)
@@ -151,6 +162,13 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_configure
     "~/commands", rclcpp::SystemDefaultsQoS(),
     [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) { command_callback(msg); });
 
+  // Speed scaling topic subscription (fallback when no state interface configured)
+  speed_scaling_subscriber_ = get_node()->create_subscription<std_msgs::msg::Float64>(
+    "~/speed_scaling_input", rclcpp::SystemDefaultsQoS(),
+    [this](const std_msgs::msg::Float64::SharedPtr msg) {
+      rt_speed_scaling_.writeFromNonRT(msg->data);
+    });
+
   // Initialize command buffer
   last_command_msg_ = std::make_shared<std_msgs::msg::Float64MultiArray>();
   rt_command_ptr_.writeFromNonRT(last_command_msg_);
@@ -165,6 +183,7 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_activate(
   // Clear joint interface references
   joint_position_command_interfaces_.clear();
   joint_position_state_interfaces_.clear();
+  speed_scaling_state_interface_.clear();
 
   // Assign command interfaces in joint_names_ order
   for (const auto & joint_name : joint_names_)
@@ -205,6 +224,31 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_activate(
     joint_position_state_interfaces_.emplace_back(std::ref(*it));
   }
 
+  // Optionally claim the speed scaling state interface
+  if (!speed_scaling_state_interface_name_.empty())
+  {
+    const auto slash = speed_scaling_state_interface_name_.find('/');
+    const std::string prefix = speed_scaling_state_interface_name_.substr(0, slash);
+    const std::string iface  = speed_scaling_state_interface_name_.substr(slash + 1);
+    auto it = std::find_if(
+      state_interfaces_.begin(), state_interfaces_.end(),
+      [&](const hardware_interface::LoanedStateInterface & si) {
+        return si.get_prefix_name() == prefix && si.get_interface_name() == iface;
+      });
+    if (it != state_interfaces_.end())
+    {
+      speed_scaling_state_interface_.emplace_back(std::ref(*it));
+      RCLCPP_INFO(get_node()->get_logger(), "Speed scaling state interface claimed");
+    }
+    else
+    {
+      RCLCPP_WARN(
+        get_node()->get_logger(),
+        "Speed scaling state interface '%s' not found, falling back to topic",
+        speed_scaling_state_interface_name_.c_str());
+    }
+  }
+
   // Initialize Ruckig with current joint positions and pre-seed command
   // interfaces so write() sends the current position even before the first
   // update() cycle (ur_robot_driver does not guard against NaN in write())
@@ -223,6 +267,7 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_deactivat
   // Release interfaces
   joint_position_command_interfaces_.clear();
   joint_position_state_interfaces_.clear();
+  speed_scaling_state_interface_.clear();
 
   trajectory_initialized_ = false;
   new_command_available_ = false;
@@ -235,6 +280,26 @@ controller_interface::CallbackReturn ConstrainedPositionController::on_deactivat
 controller_interface::return_type ConstrainedPositionController::update(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
+  // Determine speed scaling factor
+  double speed_scaling = 1.0;
+  if (!speed_scaling_state_interface_.empty())
+  {
+    speed_scaling = speed_scaling_state_interface_[0].get().get_value();
+  }
+  else
+  {
+    const double * ptr = rt_speed_scaling_.readFromRT();
+    if (ptr) { speed_scaling = *ptr; }
+  }
+
+  // If speed scaling is essentially zero (safeguard stop, e-stop) skip Ruckig
+  // entirely so the trajectory state is perfectly frozen for any duration.
+  // The last commanded position stays on the command interfaces unchanged.
+  if (speed_scaling < 1e-6)
+  {
+    return controller_interface::return_type::OK;
+  }
+
   // Get latest command
   auto current_command = rt_command_ptr_.readFromRT();
 
@@ -242,18 +307,24 @@ controller_interface::return_type ConstrainedPositionController::update(
   if (current_command && *current_command &&
       (*current_command)->data.size() == joint_names_.size())
   {
-
-    // Update target positions
     ruckig_input_->target_position = (*current_command)->data;
-
-    // Set zero target velocity and acceleration for position-only control
     std::fill(ruckig_input_->target_velocity.begin(),
               ruckig_input_->target_velocity.end(), 0.0);
     std::fill(ruckig_input_->target_acceleration.begin(),
               ruckig_input_->target_acceleration.end(), 0.0);
-
-    // Clear the command to avoid reprocessing
     rt_command_ptr_.writeFromNonRT(nullptr);
+  }
+
+  // Scale kinematic limits for this cycle.
+  // Time-scaling by s requires: vel*s, acc*s², jerk*s³ so that Ruckig
+  // generates a trajectory that is kinematically consistent at the scaled speed.
+  const double s2 = speed_scaling * speed_scaling;
+  const double s3 = s2 * speed_scaling;
+  for (size_t i = 0; i < joint_names_.size(); ++i)
+  {
+    ruckig_input_->max_velocity[i]     = velocity_limits_[i]     * speed_scaling;
+    ruckig_input_->max_acceleration[i] = acceleration_limits_[i] * s2;
+    ruckig_input_->max_jerk[i]         = jerk_limits_[i]         * s3;
   }
 
   // Calculate next trajectory point
@@ -321,7 +392,7 @@ void ConstrainedPositionController::command_callback(
   RCLCPP_DEBUG(get_node()->get_logger(), "New command received");
 }
 
-bool ConstrainedPositionController::reset_trajectory_state()
+bool ConstrainedPositionController::reset_trajectory_state(bool preserve_target)
 {
   if (joint_position_state_interfaces_.empty())
   {
@@ -343,10 +414,15 @@ bool ConstrainedPositionController::reset_trajectory_state()
     ruckig_input_->current_velocity = std::vector<double>(joint_names_.size(), 0.0);
     ruckig_input_->current_acceleration = std::vector<double>(joint_names_.size(), 0.0);
 
-    // Set target to current position (hold position)
-    ruckig_input_->target_position = current_positions;
-    ruckig_input_->target_velocity = std::vector<double>(joint_names_.size(), 0.0);
-    ruckig_input_->target_acceleration = std::vector<double>(joint_names_.size(), 0.0);
+    // Set target to current position (hold) unless caller wants to preserve
+    // the existing target (e.g. during safeguard stop, so motion resumes toward
+    // the last commanded position once the robot is released)
+    if (!preserve_target)
+    {
+      ruckig_input_->target_position = current_positions;
+      ruckig_input_->target_velocity = std::vector<double>(joint_names_.size(), 0.0);
+      ruckig_input_->target_acceleration = std::vector<double>(joint_names_.size(), 0.0);
+    }
 
     // Pre-seed command interfaces with current positions so write() sends
     // a safe value even before the first update() cycle
@@ -357,7 +433,10 @@ bool ConstrainedPositionController::reset_trajectory_state()
 
     trajectory_initialized_ = true;
 
-    RCLCPP_INFO(get_node()->get_logger(), "Trajectory state reset to current position");
+    if (!preserve_target)
+    {
+      RCLCPP_INFO(get_node()->get_logger(), "Trajectory state reset to current position");
+    }
     return true;
   }
   catch (const std::exception & e)
