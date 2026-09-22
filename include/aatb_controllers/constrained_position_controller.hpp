@@ -63,6 +63,10 @@ protected:
   std::vector<double> acceleration_limits_;
   std::vector<double> jerk_limits_;
   double control_cycle_time_;
+  double max_tracking_error_;
+  std::vector<double> position_min_;
+  std::vector<double> position_max_;
+  bool scaling_logged_{false};
 
   // Ruckig trajectory generator
   std::unique_ptr<ruckig::Ruckig<ruckig::DynamicDOFs>> ruckig_;
