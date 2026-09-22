@@ -29,3 +29,27 @@ constrained_position_controller:
 
     state_interfaces:
       - position
+
+    # --- optional -----------------------------------------------------------
+
+    # Track a hardware speed override. The controller applies it as a change of
+    # clock (it steps control_cycle_time * s of trajectory time per real cycle),
+    # so 0 is a standstill and the override can move freely mid-motion. Leave
+    # unset on hardware that publishes no such interface.
+    # speed_scaling:
+    #   state_interface: speed_scaling/speed_scaling_factor
+
+    # How far the commanded position may run ahead of the measured one [rad]
+    # before the trajectory is re-seeded from the machine. Ruckig integrates
+    # from its own output, so without this nothing ties the setpoint to the
+    # robot -- and under a speed override the robot deliberately lags.
+    max_tracking_error: 0.35
+
+    # Hard joint window [rad], absolute, one entry per joint. Enforced inside
+    # the control loop on the target and on the value written to hardware. A
+    # clamp is logged as an error because it should be unreachable. If a joint
+    # is measured outside its window the controller holds and writes nothing,
+    # rather than commanding the full distance back into it.
+    # position_limits:
+    #   min: [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14]
+    #   max: [ 3.14,  3.14,  3.14,  3.14,  3.14,  3.14]
